@@ -1,3 +1,5 @@
+
+i have an doubt as among 7 days 2 days are like holiday so as the basleine is per user per hour so 2 of those hours are from weeends where thereis almst no activity so doesint it imbalnces the baseline what do u think?
 # Multimodal UEBA Threat Detection System for Windows AD Environments
 
 ## 1. Project Objective
