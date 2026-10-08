@@ -1,0 +1,187 @@
+Implement **Option 2 temporal context** in my existing behavioral anomaly notebook.
+
+Do NOT create a separate weekend behavioral baseline.
+
+My current model already has the main behavioral baseline and scoring pipeline. Keep all of that unchanged.
+
+### Goal
+
+Add one additional signal answering:
+
+> **"How unusual is it for this user to be active at this time?"**
+
+The temporal signal must distinguish weekday vs weekend **for each user**, without treating weekends as automatically suspicious.
+
+### Design
+
+Keep the existing behavioral baseline:
+
+```text
+user × hour
+```
+
+Add a separate temporal activity profile:
+
+```text
+user × day_type × hour
+```
+
+where:
+
+```text
+day_type = weekday / weekend
+```
+
+For each user, day type and hour, calculate the historical probability of an active window:
+
+```text
+P_active = active_windows / available_windows
+```
+
+An active window means the 10-minute window has `event_count > 0`.
+
+Example:
+
+```text
+Arjun
+weekday 10 AM:
+5 active windows / 5 available windows
+P_active = 1.0
+
+weekend 10 AM:
+0 active windows / 2 available windows
+raw P_active = 0.0
+```
+
+Because only two weekend days exist, do NOT trust `0.0` directly. Apply smoothing/shrinkage so the estimate does not become an absolute zero.
+
+For example:
+
+```text
+smoothed_P =
+    (active_windows + alpha * prior_probability)
+    /
+    (available_windows + alpha)
+```
+
+Use a reasonable prior/fallback derived from the user's broader historical activity. Make `alpha` configurable.
+
+### Temporal score
+
+For the current 10-minute window:
+
+```python
+if event_count > 0:
+    s_temp = 1 - smoothed_P
+else:
+    s_temp = 0
+```
+
+This is important:
+
+An inactive Saturday window must NOT become anomalous just because the user's weekend activity probability is low.
+
+### Example
+
+Suppose:
+
+```text
+Arjun, weekday 10 AM:
+P_active = 0.90
+
+Arjun, weekend 10 AM:
+P_active = 0.25
+```
+
+Then:
+
+```text
+Monday 10:10 AM with events:
+s_temp = 1 - 0.90 = 0.10
+
+Saturday 10:10 AM with events:
+s_temp = 1 - 0.25 = 0.75
+```
+
+Therefore the Saturday activity receives a stronger temporal-context signal.
+
+This does NOT mean:
+
+```text
+weekend = malicious
+```
+
+It means:
+
+```text
+activity at this time is unusual for this particular user
+```
+
+### Integration
+
+Do not replace the existing scores.
+
+Keep:
+
+```text
+s_stat
+s_nov
+s_rare
+s_act
+s_ml
+```
+
+and add:
+
+```text
+s_temp
+```
+
+Then incorporate `s_temp` into the existing fused-risk calculation using a configurable weight.
+
+For example only:
+
+```python
+final_risk = (1 - w_temp) * existing_fused_risk + w_temp * s_temp
+```
+
+Do NOT choose `w_temp` using the final test/ground-truth labels. It must be selected using validation/training data.
+
+### Leakage requirement
+
+The temporal probability must be calculated only from information available before the current scored window.
+
+For the final test period, do not use future test events to calculate the user's temporal probability.
+
+The intended flow is:
+
+```text
+training / past history
+        ↓
+user × day_type × hour temporal profile
+        ↓
+smoothed P_active
+        ↓
+current 10-minute window
+        ↓
+s_temp
+        ↓
+existing fused risk + temporal signal
+        ↓
+alert
+```
+
+### Important constraints
+
+1. Keep the existing `user × hour` behavioral baseline.
+2. Do not build a separate full weekend baseline.
+3. Do not hard-code weekend penalties.
+4. Do not make all weekend activity suspicious.
+5. Do not use future/test information when constructing the temporal profile.
+6. Preserve the existing scoring, thresholding, ground-truth and evaluation framework.
+7. Make the new temporal component easy to ablate so we can compare:
+
+   * existing model
+   * existing model + `s_temp`
+
+The purpose is to help catch low-volume attacks that look statistically normal in the usual `user × hour` behavioral features but occur at a time that is unusual for that specific user.
