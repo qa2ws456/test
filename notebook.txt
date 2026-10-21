@@ -1,0 +1,175 @@
+Missed log-clearing windows selected: 7
+
+corp\aditya.saxena | 2026-08-06 02:50:00+00:00 | steps=[8]
+timestamp	Computer	EventID	Channel	attr_user	attr_method	SubjectUserName	SubjectDomainName	Image	CommandLine
+0	2026-08-06 02:59:35.978075+00:00	DC-01.corp.local	1	Microsoft-Windows-Sysmon/Operational	corp\aditya.saxena	A1_sysmon_User	None	None	C:\Windows\System32\wevtutil.exe	wevtutil cl Security
+1	2026-08-06 02:59:45.902172+00:00	DC-01.corp.local	1102	Security	<NA>	C_unattributed	aditya.saxena	CORP	None	None
+
+corp\aditya.saxena | 2026-08-21 12:10:00+00:00 | steps=[63]
+timestamp	Computer	EventID	Channel	attr_user	attr_method	SubjectUserName	SubjectDomainName	Image	CommandLine
+0	2026-08-21 12:19:51.386275+00:00	DC-01.corp.local	1	Microsoft-Windows-Sysmon/Operational	corp\aditya.saxena	A1_sysmon_User	None	None	C:\Windows\System32\wevtutil.exe	wevtutil cl Security
+
+
+corp\aditya.saxena | 2026-08-21 12:20:00+00:00 | steps=[63]
+timestamp	Computer	EventID	Channel	attr_user	attr_method	SubjectUserName	SubjectDomainName	Image	CommandLine
+0	2026-08-21 12:20:08.490954+00:00	DC-01.corp.local	1102	Security	<NA>	C_unattributed	aditya.saxena	CORP	None	None
+
+corp\aditya.saxena | 2026-08-26 08:50:00+00:00 | steps=[78]
+timestamp	Computer	EventID	Channel	attr_user	attr_method	SubjectUserName	SubjectDomainName	Image	CommandLine
+0	2026-08-26 08:59:52.836914+00:00	DC-01.corp.local	1	Microsoft-Windows-Sysmon/Operational	corp\aditya.saxena	A1_sysmon_User	None	None	C:\Windows\System32\wevtutil.exe	wevtutil cl Security
+
+corp\aditya.saxena | 2026-08-26 09:00:00+00:00 | steps=[78]
+timestamp	Computer	EventID	Channel	attr_user	attr_method	SubjectUserName	SubjectDomainName	Image	CommandLine
+0	2026-08-26 09:00:13.501548+00:00	DC-01.corp.local	1102	Security	<NA>	C_unattributed	aditya.saxena	CORP	None	None
+corp\prerna.verma | 2026-08-13 17:00:00+00:00 | steps=[34]
+timestamp	Computer	EventID	Channel	attr_user	attr_method	SubjectUserName	SubjectDomainName	Image	CommandLine
+0	2026-08-13 17:00:05.534604+00:00	DC-01.corp.local	1	Microsoft-Windows-Sysmon/Operational	corp\prerna.verma	A1_sysmon_User	None	None	C:\Windows\System32\wevtutil.exe	wevtutil cl Security
+1	2026-08-13 17:00:34.273783+00:00	DC-01.corp.local	1102	Security	<NA>	C_unattributed	prerna.verma	CORP	None	None
+
+corp\prerna.verma | 2026-08-24 01:20:00+00:00 | steps=[71]
+timestamp	Computer	EventID	Channel	attr_user	attr_method	SubjectUserName	SubjectDomainName	Image	CommandLine
+0	2026-08-24 01:20:16.483997+00:00	DC-01.corp.local	1	Microsoft-Windows-Sysmon/Operational	corp\prerna.verma	A1_sysmon_User	None	None	C:\Windows\System32\wevtutil.exe	wevtutil cl Security
+1	2026-08-24 01:20:28.448180+00:00	DC-01.corp.local	1102	Security	<NA>	C_unattributed	prerna.verma	CORP	None	None
+
+# DIAGNOSTIC ONLY — ground truth selects windows for inspection.
+# Nothing here changes features, scores, thresholds, or decisions.
+
+LOGCLEAR_STEPS = {8, 34, 63, 71, 78}
+
+required = {
+    "user", "win", "attack_steps", "evaluated",
+    "is_attack", "alert", "risk_score", "threshold",
+}
+missing = required - set(TE.columns)
+if missing:
+    raise ValueError(f"Missing evaluation columns: {sorted(missing)}")
+
+
+def contains_logclear_step(steps):
+    if isinstance(steps, (list, tuple, set, np.ndarray)):
+        return any(int(step) in LOGCLEAR_STEPS for step in steps)
+    return False
+
+
+audit_windows = TE.loc[
+    TE["evaluated"].fillna(False)
+    & TE["is_attack"].fillna(False)
+    & ~TE["alert"].fillna(False)
+    & TE["attack_steps"].map(contains_logclear_step)
+].copy()
+
+print(f"Missed log-clearing windows selected: {len(audit_windows)}")
+
+if audit_windows.empty:
+    raise ValueError("No matching missed windows in current TE.")
+
+if not W["wid"].is_unique:
+    raise ValueError("W has duplicate window IDs.")
+
+w_lookup = W.set_index("wid")
+
+# Identify candidate raw evidence without interpreting it as malicious.
+raw_family = raw["event_family"].astype("string").str.casefold()
+raw_channel = raw["Channel"].astype("string").str.casefold()
+
+security_clear = (
+    raw_channel.eq("security") & raw["EventID"].eq(1102)
+).fillna(False)
+
+# Diagnostic text match only; not a production command parser.
+clear_command = (
+    raw_family.eq("sysmon")
+    & raw["EventID"].eq(1)
+    & usable_text(raw["CommandLine"]).str.contains(
+        r"(?i)\bwevtutil(?:\.exe)?[\"']?\s+(?:cl|clear-log)\b"
+        r"|\bclear-eventlog\b",
+        regex=True,
+        na=False,
+    )
+).fillna(False)
+
+candidate_mask = security_clear | clear_command
+summary = []
+
+for row in audit_windows.itertuples(index=False):
+    in_window = raw["win"].eq(row.win)
+    attributed_to_user = (
+        raw["attr_user"].astype("string").eq(row.user).fillna(False)
+    )
+
+    event_mask = ev["user"].eq(row.user) & ev["win"].eq(row.win)
+
+    baseline_max = np.nan
+    if (
+        "logclear_count" in BASELINE["act_max"].columns
+        and row.user in BASELINE["act_max"].index
+    ):
+        baseline_max = float(
+            BASELINE["act_max"].loc[row.user, "logclear_count"]
+        )
+
+    window_count = float(
+        w_lookup.loc[row.wid, "logclear_count"]
+    )
+
+    registry_count = np.nan
+    if "_m_logclear_count" in ev.columns:
+        registry_count = int(
+            ev.loc[event_mask, "_m_logclear_count"].sum()
+        )
+
+    summary.append({
+        "user": row.user,
+        "win": row.win,
+        "steps": row.attack_steps,
+        "raw_1102_all_users": int(
+            (in_window & security_clear).sum()
+        ),
+        "raw_1102_this_user": int(
+            (in_window & security_clear & attributed_to_user).sum()
+        ),
+        "clear_commands_this_user": int(
+            (in_window & clear_command & attributed_to_user).sum()
+        ),
+        "registry_logclear_count": registry_count,
+        "window_logclear_count": window_count,
+        "baseline_logclear_max": baseline_max,
+        "logclear_activation_expected": (
+            bool(window_count > 0 and baseline_max == 0)
+            if np.isfinite(baseline_max)
+            else pd.NA
+        ),
+        "risk": row.risk_score,
+        "threshold": row.threshold,
+    })
+
+    # All identities/hosts in this exact window are shown for attribution checks.
+    # A nearby event is NOT automatically evidence for the inspected user.
+    positions = np.flatnonzero(
+        (in_window & candidate_mask).to_numpy(dtype=bool)
+    )
+
+    print(f"\n{row.user} | {row.win} | steps={row.attack_steps}")
+
+    if len(positions):
+        columns = [
+            "timestamp", "Computer", "EventID", "Channel",
+            "attr_user", "attr_method",
+            "SubjectUserName", "SubjectDomainName",
+            "Image", "CommandLine",
+        ]
+        columns = [column for column in columns if column in raw.columns]
+
+        # Filter individual Series to avoid a wide raw-table copy.
+        evidence = pd.DataFrame({
+            column: raw[column].iloc[positions].to_numpy()
+            for column in columns
+        })
+        display(evidence)
+    else:
+        print("No Security 1102 or matching clear command in this window.")
+
+LOGCLEAR_MISS_AUDIT = pd.DataFrame(summary)
+
+print("\nLOG-CLEAR MISS AUDIT")
+display(LOGCLEAR_MISS_AUDIT)
